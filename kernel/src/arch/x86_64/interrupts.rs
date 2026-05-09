@@ -985,11 +985,11 @@ extern "x86-interrupt" fn page_fault_handler(
             // the CoW path serializes its page-table mutation under the
             // current address-space lock before issuing TLB shootdowns.
             if resolve_cow_fault(fault_addr_u64) {
-                // Phase 61 Track E.4: CoW resolution is the canonical
-                // minor-fault site (no backing-store I/O). Major faults
-                // require the disk-backed mmap path which is not yet
-                // wired; the major counter stays at 0 in practice today.
-                crate::task::scheduler::current_task_record_page_fault(false);
+                // DIAGNOSTIC: per-fault rusage accounting disabled to A/B-test
+                // whether Phase 61 Track E.4's scheduler-lock attempts in IRQ
+                // context are responsible for the vfs_server slow_req tail
+                // latency observed on this branch. Re-enable to measure delta.
+                // crate::task::scheduler::current_task_record_page_fault(false);
                 assert_preempt_count_zero_on_return_to_user(&stack_frame);
                 return;
             }
@@ -1463,14 +1463,12 @@ pub unsafe extern "C" fn timer_handler_user(frame: &mut PreemptTrapFrameUser) {
         // common case (no input) costs one port read per tick.
         ps2_drain_all_bytes();
     }
-    // Phase 61 Track E.2 — per-tick CPU-time sampling. The interrupted
-    // task was in ring 3, so this tick is attributed to user_ticks.
-    // Runs on every core (not just BSP) because every core's timer tick
-    // is an independent sample of THAT core's running task. Scale the
-    // increment by the local LAPIC period so AP cores (10 ms) and the BSP
-    // (1 ms) attribute time on the same `1 tick = 1 ms` scale.
-    let period_ms: u64 = if crate::smp::is_bsp() { 1 } else { 10 };
-    crate::task::scheduler::tick_account_current_task(true, period_ms);
+    // DIAGNOSTIC: per-tick CS sampling (Phase 61 Track E.2) disabled to
+    // A/B-test whether the per-tick scheduler-lock attempts on every core
+    // are responsible for the vfs_server slow_req tail latency observed
+    // on this branch. Re-enable to measure delta.
+    // let period_ms: u64 = if crate::smp::is_bsp() { 1 } else { 10 };
+    // crate::task::scheduler::tick_account_current_task(true, period_ms);
     crate::task::signal_reschedule();
     maybe_redirect_group_exit_trampoline_user(frame);
     if USING_APIC.load(Ordering::Relaxed) {
@@ -1516,12 +1514,9 @@ pub unsafe extern "C" fn timer_handler_kernel(
         // See the matching note in `timer_handler_user`.
         ps2_drain_all_bytes();
     }
-    // Phase 61 Track E.2 — per-tick CPU-time sampling. The interrupted
-    // task was in ring 0 (kernel mode — typically inside a syscall),
-    // so this tick is attributed to system_ticks. See the matching note
-    // in `timer_handler_user` for the BSP/AP period scaling.
-    let period_ms: u64 = if crate::smp::is_bsp() { 1 } else { 10 };
-    crate::task::scheduler::tick_account_current_task(false, period_ms);
+    // DIAGNOSTIC: see matching note in `timer_handler_user` above.
+    // let period_ms: u64 = if crate::smp::is_bsp() { 1 } else { 10 };
+    // crate::task::scheduler::tick_account_current_task(false, period_ms);
     crate::task::signal_reschedule();
     if USING_APIC.load(Ordering::Relaxed) {
         super::apic::lapic_eoi();
