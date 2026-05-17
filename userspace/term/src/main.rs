@@ -197,6 +197,27 @@ fn program_main(_args: &[&str]) -> i32 {
         return 6;
     }
 
+    // DIAG-FIX candidate: tell the PTY its real geometry up-front.
+    // term::Screen defaults to DEFAULT_COLS×DEFAULT_ROWS (80×25), but
+    // the kernel-side PTY defaults to 80×24 (`Winsize::default_console`),
+    // so without this call the shell + less query TIOCGWINSZ and see
+    // the wrong dimensions until something (today: nothing) calls
+    // TIOCSWINSZ via handle_surface_resize.
+    {
+        let ws = syscall_lib::Winsize {
+            ws_row: term::DEFAULT_ROWS,
+            ws_col: term::DEFAULT_COLS,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let _ = syscall_lib::ioctl(
+            primary_fd,
+            syscall_lib::TIOCSWINSZ,
+            &ws as *const syscall_lib::Winsize as usize,
+        );
+        syscall_lib::write_str(STDOUT_FILENO, "term: initial TIOCSWINSZ=80x25\n");
+    }
+
     // 4. Compose the screen state machine, the renderer, the input
     //    translator, and the bell. Bell starts on the production
     //    AudioClientBellSink; on first AudioUnavailable we swap
@@ -294,10 +315,15 @@ fn program_main(_args: &[&str]) -> i32 {
             // TEMPORARY: dump every PTY-in byte to serial so we can see
             // exactly which escape sequence triggers the Clear / Scroll
             // events traced below. Remove before merge.
+            //
+            // The earlier coarse tagging hid which `\E[<n>J` parameter
+            // was being used (0/1/2).  This version tags each digit
+            // individually so the param can be reconstructed.
             for &byte in &pty_buf[..n as usize] {
                 let tag: &str = match byte {
                     0x1b => "PI:ESC\n",
                     0x07 => "PI:BEL\n",
+                    0x0c => "PI:^L\n",
                     b'\r' => "PI:CR\n",
                     b'\n' => "PI:LF\n",
                     b'\t' => "PI:TAB\n",
@@ -311,11 +337,20 @@ fn program_main(_args: &[&str]) -> i32 {
                     b'H' => "PI:H\n",
                     b'J' => "PI:J\n",
                     b'K' => "PI:K\n",
+                    b'0' => "PI:0\n",
+                    b'1' => "PI:1\n",
+                    b'2' => "PI:2\n",
+                    b'3' => "PI:3\n",
+                    b'4' => "PI:4\n",
+                    b'5' => "PI:5\n",
+                    b'6' => "PI:6\n",
+                    b'7' => "PI:7\n",
+                    b'8' => "PI:8\n",
+                    b'9' => "PI:9\n",
                     b'A'..=b'G' => "PI:A-G\n",
                     b'L'..=b'Z' => "PI:L-Z\n",
                     b'm' => "PI:m\n",
                     b'a'..=b'z' => "PI:lo\n",
-                    b'0'..=b'9' => "PI:dig\n",
                     0x20..=0x7e => "PI:print\n",
                     _ => "PI:byte\n",
                 };
