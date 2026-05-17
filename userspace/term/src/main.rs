@@ -409,16 +409,22 @@ fn program_main(_args: &[&str]) -> i32 {
             match pull_one_event(display_handle, &mut event_buf) {
                 PulledEvent::Key(ev) => {
                     did_work = true;
+                    // DIAG: log every Key event so we can see if display_server
+                    // is sending phantom keys that drive less to redraw.
+                    let _ = syscall_lib::write_str(STDOUT_FILENO, "EV:Key\n");
                     input_handler.translate(&ev, &mut writer);
                 }
                 PulledEvent::Pointer(ev) => {
                     did_work = true;
+                    let _ = syscall_lib::write_str(STDOUT_FILENO, "EV:Ptr\n");
                     if let Some(bytes) = mouse_reporter.encode(&ev, screen.cols(), screen.rows()) {
+                        let _ = syscall_lib::write_str(STDOUT_FILENO, "EV:Ptr->PTY\n");
                         let _ = syscall_lib::write(primary_fd, bytes.as_slice());
                     }
                 }
                 PulledEvent::SurfaceResized { width, height } => {
                     did_work = true;
+                    let _ = syscall_lib::write_str(STDOUT_FILENO, "EV:Resize\n");
                     handle_surface_resize(primary_fd, &mut screen, &mut renderer, width, height);
                 }
                 PulledEvent::Disconnect => {
@@ -519,6 +525,24 @@ struct PrimaryFdWriter {
 #[cfg(not(test))]
 impl PtyWriter for PrimaryFdWriter {
     fn write(&mut self, bytes: &[u8]) {
+        // DIAG: log every byte we forward to the PTY primary so we can
+        // see exactly what less is receiving as input.
+        for &b in bytes {
+            let tag: &str = match b {
+                0x1b => "PO:ESC\n",
+                0x0c => "PO:^L\n",
+                0x07 => "PO:BEL\n",
+                b'\r' => "PO:CR\n",
+                b'\n' => "PO:LF\n",
+                b'\t' => "PO:TAB\n",
+                b'\x08' => "PO:BS\n",
+                b'[' => "PO:[\n",
+                b'A'..=b'D' => "PO:arr\n",
+                0x20..=0x7e => "PO:print\n",
+                _ => "PO:byte\n",
+            };
+            let _ = syscall_lib::write_str(STDOUT_FILENO, tag);
+        }
         let rc = syscall_lib::write(self.fd, bytes);
         if rc < 0 {
             if !self.warned {
