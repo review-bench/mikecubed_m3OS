@@ -197,6 +197,27 @@ fn program_main(_args: &[&str]) -> i32 {
         return 6;
     }
 
+    // DIAG-FIX candidate: tell the PTY its real geometry up-front.
+    // term::Screen defaults to DEFAULT_COLS×DEFAULT_ROWS (80×25), but
+    // the kernel-side PTY defaults to 80×24 (`Winsize::default_console`),
+    // so without this call the shell + less query TIOCGWINSZ and see
+    // the wrong dimensions until something (today: nothing) calls
+    // TIOCSWINSZ via handle_surface_resize.
+    {
+        let ws = syscall_lib::Winsize {
+            ws_row: term::DEFAULT_ROWS,
+            ws_col: term::DEFAULT_COLS,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let _ = syscall_lib::ioctl(
+            primary_fd,
+            syscall_lib::TIOCSWINSZ,
+            &ws as *const syscall_lib::Winsize as usize,
+        );
+        syscall_lib::write_str(STDOUT_FILENO, "term: initial TIOCSWINSZ=80x25\n");
+    }
+
     // 4. Compose the screen state machine, the renderer, the input
     //    translator, and the bell. Bell starts on the production
     //    AudioClientBellSink; on first AudioUnavailable we swap
@@ -291,10 +312,67 @@ fn program_main(_args: &[&str]) -> i32 {
             // diagnostic was removed in the Phase 57e deferral cleanup
             // (2026-05-07).  The shell's backspace sequence was settled;
             // 30 hex-dump lines per boot earned no ongoing value.
+            // TEMPORARY: dump every PTY-in byte to serial so we can see
+            // exactly which escape sequence triggers the Clear / Scroll
+            // events traced below. Remove before merge.
+            //
+            // The earlier coarse tagging hid which `\E[<n>J` parameter
+            // was being used (0/1/2).  This version tags each digit
+            // individually so the param can be reconstructed.
+            for &byte in &pty_buf[..n as usize] {
+                let tag: &str = match byte {
+                    0x1b => "PI:ESC\n",
+                    0x07 => "PI:BEL\n",
+                    0x0c => "PI:^L\n",
+                    b'\r' => "PI:CR\n",
+                    b'\n' => "PI:LF\n",
+                    b'\t' => "PI:TAB\n",
+                    b'\x08' => "PI:BS\n",
+                    b'[' => "PI:[\n",
+                    b']' => "PI:]\n",
+                    b';' => "PI:;\n",
+                    b'?' => "PI:?\n",
+                    b'h' => "PI:h\n",
+                    b'l' => "PI:l\n",
+                    b'H' => "PI:H\n",
+                    b'J' => "PI:J\n",
+                    b'K' => "PI:K\n",
+                    b'0' => "PI:0\n",
+                    b'1' => "PI:1\n",
+                    b'2' => "PI:2\n",
+                    b'3' => "PI:3\n",
+                    b'4' => "PI:4\n",
+                    b'5' => "PI:5\n",
+                    b'6' => "PI:6\n",
+                    b'7' => "PI:7\n",
+                    b'8' => "PI:8\n",
+                    b'9' => "PI:9\n",
+                    b'A'..=b'G' => "PI:A-G\n",
+                    b'L'..=b'Z' => "PI:L-Z\n",
+                    b'm' => "PI:m\n",
+                    b'a'..=b'z' => "PI:lo\n",
+                    0x20..=0x7e => "PI:print\n",
+                    _ => "PI:byte\n",
+                };
+                let _ = syscall_lib::write_str(STDOUT_FILENO, tag);
+            }
             for &byte in &pty_buf[..n as usize] {
                 screen.feed(byte, &mut render_cmds);
             }
             for cmd in render_cmds.drain(..) {
+                // TEMPORARY DIAGNOSTIC TRACE — less render bug investigation.
+                // Remove before merge. Tags only; no formatted args.
+                let tag: &str = match &cmd {
+                    RenderCommand::PutGlyph { .. } => "TT:Put\n",
+                    RenderCommand::Clear => "TT:Clear\n",
+                    RenderCommand::Scroll { .. } => "TT:Scroll\n",
+                    RenderCommand::MoveCursor { .. } => "TT:Move\n",
+                    RenderCommand::SetColor { .. } => "TT:Color\n",
+                    RenderCommand::Bell => "TT:Bell\n",
+                    RenderCommand::SetMouseMode { .. } => "TT:Mouse\n",
+                };
+                let _ = syscall_lib::write_str(STDOUT_FILENO, tag);
+
                 match cmd {
                     RenderCommand::Bell => {
                         ring_bell(&mut bell_audio, &mut bell_unavail, clock.now_ms());
@@ -331,16 +409,22 @@ fn program_main(_args: &[&str]) -> i32 {
             match pull_one_event(display_handle, &mut event_buf) {
                 PulledEvent::Key(ev) => {
                     did_work = true;
+                    // DIAG: log every Key event so we can see if display_server
+                    // is sending phantom keys that drive less to redraw.
+                    let _ = syscall_lib::write_str(STDOUT_FILENO, "EV:Key\n");
                     input_handler.translate(&ev, &mut writer);
                 }
                 PulledEvent::Pointer(ev) => {
                     did_work = true;
+                    let _ = syscall_lib::write_str(STDOUT_FILENO, "EV:Ptr\n");
                     if let Some(bytes) = mouse_reporter.encode(&ev, screen.cols(), screen.rows()) {
+                        let _ = syscall_lib::write_str(STDOUT_FILENO, "EV:Ptr->PTY\n");
                         let _ = syscall_lib::write(primary_fd, bytes.as_slice());
                     }
                 }
                 PulledEvent::SurfaceResized { width, height } => {
                     did_work = true;
+                    let _ = syscall_lib::write_str(STDOUT_FILENO, "EV:Resize\n");
                     handle_surface_resize(primary_fd, &mut screen, &mut renderer, width, height);
                 }
                 PulledEvent::Disconnect => {
@@ -441,6 +525,24 @@ struct PrimaryFdWriter {
 #[cfg(not(test))]
 impl PtyWriter for PrimaryFdWriter {
     fn write(&mut self, bytes: &[u8]) {
+        // DIAG: log every byte we forward to the PTY primary so we can
+        // see exactly what less is receiving as input.
+        for &b in bytes {
+            let tag: &str = match b {
+                0x1b => "PO:ESC\n",
+                0x0c => "PO:^L\n",
+                0x07 => "PO:BEL\n",
+                b'\r' => "PO:CR\n",
+                b'\n' => "PO:LF\n",
+                b'\t' => "PO:TAB\n",
+                b'\x08' => "PO:BS\n",
+                b'[' => "PO:[\n",
+                b'A'..=b'D' => "PO:arr\n",
+                0x20..=0x7e => "PO:print\n",
+                _ => "PO:byte\n",
+            };
+            let _ = syscall_lib::write_str(STDOUT_FILENO, tag);
+        }
         let rc = syscall_lib::write(self.fd, bytes);
         if rc < 0 {
             if !self.warned {
