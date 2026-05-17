@@ -295,6 +295,19 @@ fn program_main(_args: &[&str]) -> i32 {
                 screen.feed(byte, &mut render_cmds);
             }
             for cmd in render_cmds.drain(..) {
+                // TEMPORARY DIAGNOSTIC TRACE — less render bug investigation.
+                // Remove before merge. Tags only; no formatted args.
+                let tag: &str = match &cmd {
+                    RenderCommand::PutGlyph { .. } => "TT:Put\n",
+                    RenderCommand::Clear => "TT:Clear\n",
+                    RenderCommand::Scroll { .. } => "TT:Scroll\n",
+                    RenderCommand::MoveCursor { .. } => "TT:Move\n",
+                    RenderCommand::SetColor { .. } => "TT:Color\n",
+                    RenderCommand::Bell => "TT:Bell\n",
+                    RenderCommand::SetMouseMode { .. } => "TT:Mouse\n",
+                };
+                let _ = syscall_lib::write_str(STDOUT_FILENO, tag);
+
                 match cmd {
                     RenderCommand::Bell => {
                         ring_bell(&mut bell_audio, &mut bell_unavail, clock.now_ms());
