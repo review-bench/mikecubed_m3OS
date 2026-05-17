@@ -322,6 +322,14 @@ pub struct Screen {
     cursor_shape: CursorShape,
     /// Phase 69 Track G — `?2004` bracketed-paste enabled bit.
     bracketed_paste_enabled: bool,
+    /// Phase 69d-FU — DECSTBM scroll region top (0-based, inclusive).
+    /// Defaults to `0`.  Less and other TUI apps narrow this with `csr`
+    /// so subsequent newlines / SU / SD / IL / DL operate on a
+    /// sub-rectangle of the screen.
+    scroll_top: u16,
+    /// Phase 69d-FU — DECSTBM scroll region bottom (0-based, inclusive).
+    /// Defaults to `rows - 1`.
+    scroll_bottom: u16,
     /// ANSI parser state.
     parser: AnsiParser,
     /// Phase 69b Track B.2 — UTF-8 byte-stream decoder. Bytes are
@@ -359,6 +367,8 @@ impl Screen {
             bg: DEFAULT_BG,
             cursor_shape: CursorShape::BlinkingBlock,
             bracketed_paste_enabled: false,
+            scroll_top: 0,
+            scroll_bottom: rows.saturating_sub(1),
             parser: AnsiParser::new(),
             decoder: Utf8Decoder::new(),
         }
@@ -490,6 +500,15 @@ impl Screen {
         }
         if self.cursor_col > cols {
             self.cursor_col = cols;
+        }
+        // Phase 69d-FU — reclamp the scroll region.  Any saved bounds
+        // outside the new geometry collapse to the full screen so a
+        // subsequent line_feed cannot reference a row we no longer have.
+        self.scroll_top = self.scroll_top.min(rows.saturating_sub(1));
+        self.scroll_bottom = self.scroll_bottom.min(rows.saturating_sub(1));
+        if self.scroll_top >= self.scroll_bottom {
+            self.scroll_top = 0;
+            self.scroll_bottom = rows.saturating_sub(1);
         }
         out.push(RenderCommand::Clear);
         let cols_now = self.cols;
@@ -747,6 +766,24 @@ impl Screen {
                 self.cursor_shape = CursorShape::from_code(shape);
             }
             ConsoleCmd::Sgr(sgr) => self.apply_sgr_ops(sgr.ops(), out),
+            ConsoleCmd::SetScrollRegion { top, bottom } => {
+                self.set_scroll_region(top, bottom, out);
+            }
+            ConsoleCmd::VerticalPositionAbsolute(n) => {
+                let r = n.saturating_sub(1).min(self.rows.saturating_sub(1));
+                self.cursor_row = r;
+                out.push(RenderCommand::MoveCursor {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                });
+            }
+            ConsoleCmd::ScrollUp(n) => self.scroll_region_up(n.max(1), out),
+            ConsoleCmd::ScrollDown(n) => self.scroll_region_down(n.max(1), out),
+            ConsoleCmd::InsertLines(n) => self.insert_lines(n.max(1), out),
+            ConsoleCmd::DeleteLines(n) => self.delete_lines(n.max(1), out),
+            ConsoleCmd::InsertChars(n) => self.insert_chars(n.max(1), out),
+            ConsoleCmd::DeleteChars(n) => self.delete_chars(n.max(1), out),
+            ConsoleCmd::EraseChars(n) => self.erase_chars(n.max(1), out),
         }
     }
 
@@ -903,9 +940,14 @@ impl Screen {
 
     fn line_feed(&mut self, out: &mut Vec<RenderCommand>) {
         self.cursor_col = 0;
-        if self.cursor_row + 1 >= self.rows {
-            self.scroll_up(out);
-        } else {
+        // Honour the DECSTBM scroll region: when the cursor sits on
+        // the bottom margin of the region, a line-feed scrolls the
+        // region up by one and the cursor stays put.  Outside the
+        // region (cursor below scroll_bottom) the cursor simply
+        // advances until it hits the bottom of the surface.
+        if self.cursor_row == self.scroll_bottom {
+            self.scroll_region_up(1, out);
+        } else if self.cursor_row + 1 < self.rows {
             self.cursor_row += 1;
         }
         out.push(RenderCommand::MoveCursor {
@@ -914,32 +956,249 @@ impl Screen {
         });
     }
 
-    fn scroll_up(&mut self, out: &mut Vec<RenderCommand>) {
+    /// Phase 69d-FU — scroll the active scroll region up by `n` lines.
+    /// The top `n` rows of the region are lost (with scrollback eviction
+    /// only when the region covers the full primary surface).  The
+    /// bottom `n` rows of the region are blanked.
+    fn scroll_region_up(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 || self.scroll_top > self.scroll_bottom {
+            return;
+        }
+        let region_height = self.scroll_bottom - self.scroll_top + 1;
+        let n = n.min(region_height);
+        let top = self.scroll_top as usize;
+        let bot = self.scroll_bottom as usize;
         let cols = self.cols as usize;
         let fg = self.fg;
         let bg = self.bg;
         let primary = matches!(self.active, ScreenSelect::Primary);
-        // Evict the top row into scrollback (capped) ONLY when the
-        // primary grid is active. Standard terminal behaviour: the
-        // alternate screen does not feed scrollback.
-        if primary {
-            let evicted: Vec<Cell> = self.buf[0..cols].to_vec();
-            if self.scrollback.len() >= SCROLLBACK_LINES {
-                self.scrollback.remove(0);
+        let full_screen = self.scroll_top == 0 && self.scroll_bottom + 1 == self.rows;
+        // Evict only when the region is the full primary surface — the
+        // alternate screen and partial regions do not feed scrollback
+        // per xterm.
+        if primary && full_screen {
+            for r in 0..n as usize {
+                let evicted: Vec<Cell> = self.buf[r * cols..(r + 1) * cols].to_vec();
+                if self.scrollback.len() >= SCROLLBACK_LINES {
+                    self.scrollback.remove(0);
+                }
+                self.scrollback.push(evicted);
             }
-            self.scrollback.push(evicted);
         }
-        // Shift every other row of the active grid up by one.
-        let total = self.cols as usize * self.rows as usize;
         let active = self.active_buf_mut();
-        for i in 0..(total - cols) {
-            active[i] = active[i + cols];
+        // Shift rows up within the region: row `r` <- row `r + n`.
+        for r in top..=(bot - n as usize) {
+            let src = r + n as usize;
+            for c in 0..cols {
+                active[r * cols + c] = active[src * cols + c];
+            }
         }
-        // Blank the new bottom row.
-        for i in (total - cols)..total {
-            active[i] = Cell::blank(fg, bg);
+        // Blank the bottom `n` rows of the region.
+        for r in (bot + 1 - n as usize)..=bot {
+            for c in 0..cols {
+                active[r * cols + c] = Cell::blank(fg, bg);
+            }
         }
-        out.push(RenderCommand::Scroll { amount: 1 });
+        // Re-emit the affected cells.  The full-screen case can use
+        // the fast `Scroll` framebuffer command; partial regions need
+        // per-cell PutGlyph since the framebuffer scroll is whole-surface.
+        if full_screen {
+            out.push(RenderCommand::Scroll { amount: n as i16 });
+        } else {
+            self.emit_region(top, bot, out);
+        }
+    }
+
+    /// Phase 69d-FU — scroll the active scroll region down by `n` lines.
+    /// The bottom `n` rows of the region are lost; the top `n` rows are
+    /// blanked.  Scrollback is never fed (xterm semantics).
+    fn scroll_region_down(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 || self.scroll_top > self.scroll_bottom {
+            return;
+        }
+        let region_height = self.scroll_bottom - self.scroll_top + 1;
+        let n = n.min(region_height);
+        let top = self.scroll_top as usize;
+        let bot = self.scroll_bottom as usize;
+        let cols = self.cols as usize;
+        let fg = self.fg;
+        let bg = self.bg;
+        let active = self.active_buf_mut();
+        // Shift rows down within the region: row `r` <- row `r - n`,
+        // iterating from the bottom up so we don't clobber sources.
+        for r in (top + n as usize..=bot).rev() {
+            let src = r - n as usize;
+            for c in 0..cols {
+                active[r * cols + c] = active[src * cols + c];
+            }
+        }
+        // Blank the top `n` rows of the region.
+        for r in top..top + n as usize {
+            for c in 0..cols {
+                active[r * cols + c] = Cell::blank(fg, bg);
+            }
+        }
+        self.emit_region(top, bot, out);
+    }
+
+    /// Phase 69d-FU — re-emit every cell in rows `[top, bot]` as PutGlyph
+    /// commands so the renderer repaints the region after an in-buffer
+    /// shift.  Used by partial-region scrolls and by IL / DL.
+    fn emit_region(&self, top: usize, bot: usize, out: &mut Vec<RenderCommand>) {
+        let cols = self.cols as usize;
+        let buf = self.active_buf();
+        for r in top..=bot {
+            for c in 0..cols {
+                let cell = buf[r * cols + c];
+                out.push(RenderCommand::PutGlyph {
+                    row: r as u16,
+                    col: c as u16,
+                    codepoint: cell.codepoint,
+                    fg: cell.fg,
+                    bg: cell.bg,
+                });
+            }
+        }
+    }
+
+    /// Phase 69d-FU — re-emit one row's cells as PutGlyphs.  Used by
+    /// ICH / DCH / ECH after an in-place row mutation.
+    fn emit_row(&self, row: usize, out: &mut Vec<RenderCommand>) {
+        let cols = self.cols as usize;
+        let buf = self.active_buf();
+        for c in 0..cols {
+            let cell = buf[row * cols + c];
+            out.push(RenderCommand::PutGlyph {
+                row: row as u16,
+                col: c as u16,
+                codepoint: cell.codepoint,
+                fg: cell.fg,
+                bg: cell.bg,
+            });
+        }
+    }
+
+    /// Phase 69d-FU — set the DECSTBM scroll region.  Both bounds are
+    /// 1-based in the wire protocol; passing `(0, 0)` resets to the
+    /// full screen.  Bounds outside the screen are clamped; an
+    /// inverted region (`top >= bottom` after clamping) also resets.
+    fn set_scroll_region(&mut self, top: u16, bottom: u16, out: &mut Vec<RenderCommand>) {
+        let (new_top, new_bottom) = if top == 0 && bottom == 0 {
+            (0u16, self.rows.saturating_sub(1))
+        } else {
+            let t = top.saturating_sub(1).min(self.rows.saturating_sub(1));
+            let b = bottom.saturating_sub(1).min(self.rows.saturating_sub(1));
+            if t >= b {
+                (0u16, self.rows.saturating_sub(1))
+            } else {
+                (t, b)
+            }
+        };
+        self.scroll_top = new_top;
+        self.scroll_bottom = new_bottom;
+        // DECSTBM moves the cursor to (1,1) per the standard.
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        out.push(RenderCommand::MoveCursor {
+            row: self.cursor_row,
+            col: self.cursor_col,
+        });
+    }
+
+    /// Phase 69d-FU — IL: insert `n` blank lines at the cursor (or
+    /// rather at `cursor_row`), shifting content within the scroll
+    /// region downward.  Lines pushed past `scroll_bottom` are lost.
+    /// No-op when the cursor is outside the scroll region.
+    fn insert_lines(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 {
+            return;
+        }
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+        let top = self.cursor_row;
+        let saved_top = self.scroll_top;
+        self.scroll_top = top;
+        self.scroll_region_down(n, out);
+        self.scroll_top = saved_top;
+    }
+
+    /// Phase 69d-FU — DL: delete `n` lines starting at the cursor,
+    /// shifting content within the scroll region upward.  Bottom `n`
+    /// lines blanked.  No-op when the cursor is outside the scroll
+    /// region.
+    fn delete_lines(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 {
+            return;
+        }
+        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+            return;
+        }
+        let top = self.cursor_row;
+        let saved_top = self.scroll_top;
+        self.scroll_top = top;
+        self.scroll_region_up(n, out);
+        self.scroll_top = saved_top;
+    }
+
+    /// Phase 69d-FU — ICH: insert `n` blank cells at the cursor,
+    /// shifting cells right.  Cells pushed past the last column are
+    /// lost.
+    fn insert_chars(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 || self.cursor_col >= self.cols {
+            return;
+        }
+        let n = n.min(self.cols - self.cursor_col);
+        let row = self.cursor_row as usize;
+        let cols = self.cols as usize;
+        let start = self.cursor_col as usize;
+        let fg = self.fg;
+        let bg = self.bg;
+        let buf = self.active_buf_mut();
+        // Shift right: iterate from end so we don't clobber sources.
+        for c in (start + n as usize..cols).rev() {
+            buf[row * cols + c] = buf[row * cols + c - n as usize];
+        }
+        for c in start..start + n as usize {
+            buf[row * cols + c] = Cell::blank(fg, bg);
+        }
+        self.emit_row(row, out);
+    }
+
+    /// Phase 69d-FU — DCH: delete `n` cells at the cursor, shifting
+    /// the rest of the row left.  Last `n` cells of the row are blanked.
+    fn delete_chars(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 || self.cursor_col >= self.cols {
+            return;
+        }
+        let n = n.min(self.cols - self.cursor_col);
+        let row = self.cursor_row as usize;
+        let cols = self.cols as usize;
+        let start = self.cursor_col as usize;
+        let fg = self.fg;
+        let bg = self.bg;
+        let buf = self.active_buf_mut();
+        for c in start..cols - n as usize {
+            buf[row * cols + c] = buf[row * cols + c + n as usize];
+        }
+        for c in cols - n as usize..cols {
+            buf[row * cols + c] = Cell::blank(fg, bg);
+        }
+        self.emit_row(row, out);
+    }
+
+    /// Phase 69d-FU — ECH: blank `n` cells starting at the cursor;
+    /// cursor position unchanged.
+    fn erase_chars(&mut self, n: u16, out: &mut Vec<RenderCommand>) {
+        if n == 0 || self.cursor_col >= self.cols {
+            return;
+        }
+        let n = n.min(self.cols - self.cursor_col);
+        let row = self.cursor_row;
+        let start_col = self.cursor_col;
+        for c in start_col..start_col + n {
+            self.blank_cell(row, c, out);
+        }
     }
 
     /// ED 0: blank from `(cursor_row, cursor_col)` (inclusive) to the

@@ -73,6 +73,40 @@ pub enum ConsoleCmd {
     /// SGR — Set Graphic Rendition. Parameters stored as a slice reference
     /// isn't possible in a Copy enum, so we use a small inline array.
     Sgr(SgrParams),
+    /// DECSTBM — Set Top and Bottom Margins (`CSI <top> ; <bot> r`).
+    /// Both bounds are 1-based; when both are missing the consumer
+    /// should reset to the full screen. Less and other TUI apps use
+    /// this to limit subsequent scrolling to a sub-rectangle.
+    SetScrollRegion { top: u16, bottom: u16 },
+    /// VPA — Vertical Position Absolute (`CSI <n> d`). Moves the
+    /// cursor to row `n` (1-based) without changing the column.  Less
+    /// emits `vpa` heavily during incremental line repaints.
+    VerticalPositionAbsolute(u16),
+    /// IL — Insert N Lines (`CSI <n> L`). Inserts N blank lines at the
+    /// cursor, scrolling content within the current scroll region
+    /// downward.
+    InsertLines(u16),
+    /// DL — Delete N Lines (`CSI <n> M`). Deletes N lines starting at
+    /// the cursor, scrolling content within the current scroll region
+    /// upward.
+    DeleteLines(u16),
+    /// ICH — Insert N Characters (`CSI <n> @`). Inserts N blank cells
+    /// at the cursor, shifting the rest of the row right.
+    InsertChars(u16),
+    /// DCH — Delete N Characters (`CSI <n> P`). Deletes N cells at the
+    /// cursor, shifting the rest of the row left.
+    DeleteChars(u16),
+    /// ECH — Erase N Characters (`CSI <n> X`). Blanks N cells starting
+    /// at the cursor without moving the cursor.
+    EraseChars(u16),
+    /// SU — Scroll Up by N (`CSI <n> S`). Shifts content up within the
+    /// scroll region by N lines; top N lines are lost, bottom N
+    /// blanked.
+    ScrollUp(u16),
+    /// SD — Scroll Down by N (`CSI <n> T`). Shifts content down within
+    /// the scroll region by N lines; bottom N lines are lost, top N
+    /// blanked.
+    ScrollDown(u16),
     /// Unknown/unsupported sequence — silently ignored.
     Nop,
 }
@@ -475,6 +509,26 @@ impl AnsiParser {
             'J' => ConsoleCmd::EraseDisplay(self.param(0, 0)),
             // EL — Erase in Line
             'K' => ConsoleCmd::EraseLine(self.param(0, 0)),
+            // VPA — Vertical Position Absolute (`CSI <n> d`).
+            'd' => ConsoleCmd::VerticalPositionAbsolute(self.param(0, 1)),
+            // DECSTBM — Set Top and Bottom Margins (`CSI <top> ; <bot> r`).
+            // No params resets to full screen, encoded as (0, 0); the
+            // screen state machine interprets the zero bounds as
+            // "reset" rather than literal row zero.
+            'r' => ConsoleCmd::SetScrollRegion {
+                top: self.param(0, 0),
+                bottom: self.param(1, 0),
+            },
+            // SU / SD — Scroll Up / Down within the scroll region.
+            'S' => ConsoleCmd::ScrollUp(self.param(0, 1)),
+            'T' => ConsoleCmd::ScrollDown(self.param(0, 1)),
+            // IL / DL — Insert / Delete Lines at cursor.
+            'L' => ConsoleCmd::InsertLines(self.param(0, 1)),
+            'M' => ConsoleCmd::DeleteLines(self.param(0, 1)),
+            // ICH / DCH / ECH — Insert / Delete / Erase Characters at cursor.
+            '@' => ConsoleCmd::InsertChars(self.param(0, 1)),
+            'P' => ConsoleCmd::DeleteChars(self.param(0, 1)),
+            'X' => ConsoleCmd::EraseChars(self.param(0, 1)),
             // SGR — Select Graphic Rendition
             'm' => {
                 let count = if self.param_count == 0 {
