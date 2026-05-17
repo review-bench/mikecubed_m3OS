@@ -291,6 +291,36 @@ fn program_main(_args: &[&str]) -> i32 {
             // diagnostic was removed in the Phase 57e deferral cleanup
             // (2026-05-07).  The shell's backspace sequence was settled;
             // 30 hex-dump lines per boot earned no ongoing value.
+            // TEMPORARY: dump every PTY-in byte to serial so we can see
+            // exactly which escape sequence triggers the Clear / Scroll
+            // events traced below. Remove before merge.
+            for &byte in &pty_buf[..n as usize] {
+                let tag: &str = match byte {
+                    0x1b => "PI:ESC\n",
+                    0x07 => "PI:BEL\n",
+                    b'\r' => "PI:CR\n",
+                    b'\n' => "PI:LF\n",
+                    b'\t' => "PI:TAB\n",
+                    b'\x08' => "PI:BS\n",
+                    b'[' => "PI:[\n",
+                    b']' => "PI:]\n",
+                    b';' => "PI:;\n",
+                    b'?' => "PI:?\n",
+                    b'h' => "PI:h\n",
+                    b'l' => "PI:l\n",
+                    b'H' => "PI:H\n",
+                    b'J' => "PI:J\n",
+                    b'K' => "PI:K\n",
+                    b'A'..=b'G' => "PI:A-G\n",
+                    b'L'..=b'Z' => "PI:L-Z\n",
+                    b'm' => "PI:m\n",
+                    b'a'..=b'z' => "PI:lo\n",
+                    b'0'..=b'9' => "PI:dig\n",
+                    0x20..=0x7e => "PI:print\n",
+                    _ => "PI:byte\n",
+                };
+                let _ = syscall_lib::write_str(STDOUT_FILENO, tag);
+            }
             for &byte in &pty_buf[..n as usize] {
                 screen.feed(byte, &mut render_cmds);
             }
